@@ -1,6 +1,8 @@
 [submodule "one-pace-for-plex"]
 	path = one-pace-for-plex
 	url = https://github.com/SpykerNZ/one-pace-for-plex.git
+	branch = main
 [submodule "one-pace-public-subtitles"]
 	path = one-pace-public-subtitles
 	url = https://github.com/one-pace/one-pace-public-subtitles.git
+	branch = main
