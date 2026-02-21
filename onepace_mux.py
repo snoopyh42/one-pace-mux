@@ -349,13 +349,14 @@ def find_sub_file(  # noqa: C901
         _debug(f"sub Strategy 3 (arc name, single file): {strategy3_matches[0].name}")
         return strategy3_matches[0]
 
-    # Strategy 3b: Match by arc_folder description (e.g. "If You Could Go Anywhere" for Straw Hat Adventures)
+    # Strategy 3b: Match by arc_folder description only when exactly one file matches (e.g. "If You Could Go Anywhere")
+    # If multiple match (e.g. "Alabasta" matches Alabasta 01, 02, ...), do not use — would reuse wrong ep's subs.
     if arc.arc_folder:
-        # arc_folder is like "24 If You Could Go Anywhere" -> match "If You Could Go Anywhere"
         folder_desc = re.sub(r"^\d+\s+", "", arc.arc_folder).strip()
         if folder_desc:
             desc_flex = re.sub(r"[-'\s]+", r"[\\s'-]*", re.escape(folder_desc))
             desc_re = re.compile(rf'\b{desc_flex}\b', re.IGNORECASE)
+            strategy3b_matches = []
             for f in sorted(SUBS_FINAL_DIR.iterdir()):
                 if not f.name.endswith(".ass"):
                     continue
@@ -366,8 +367,10 @@ def find_sub_file(  # noqa: C901
                     if not f.name.endswith(final_suffix + ".ass"):
                         continue
                 if desc_re.search(f.name):
-                    _debug(f"sub Strategy 3b (arc_folder desc): {f.name}")
-                    return f
+                    strategy3b_matches.append(f)
+            if len(strategy3b_matches) == 1:
+                _debug(f"sub Strategy 3b (arc_folder desc, single file): {strategy3b_matches[0].name}")
+                return strategy3b_matches[0]
 
     # Strategy 4: Fall back to arc episode folder (e.g. "14 Skypiea/24/skypiea 24 en.ass")
     # Script arc_folder may use season numbering (e.g. "14 Alabasta"); repo may use different (e.g. "12 Alabasta")
@@ -563,17 +566,25 @@ def mux_episode(  # noqa: C901
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning", "-stats"]
 
     if dub_file:
-        # Input 0: dub (video source + English audio)
-        # Input 1: sub (Japanese audio source)
+        # Input 0: dub (English audio; video only when we have ASS so we use clean dub video)
+        # Input 1: sub (video + Japanese audio; when no ASS, sub video may have burned-in EN subs)
         cmd += ["-i", str(dub_file), "-i", str(sub_file)]
         if ass_file:
             cmd += ["-i", str(ass_file)]
 
-        cmd += [
-            "-map", "0:v:0",     # video from dub (clean)
-            "-map", "1:a:0",     # Japanese audio from sub
-            "-map", "0:a:0",     # English audio from dub
-        ]
+        if ass_file:
+            cmd += [
+                "-map", "0:v:0",     # video from dub (clean)
+                "-map", "1:a:0",     # Japanese audio from sub
+                "-map", "0:a:0",     # English audio from dub
+            ]
+        else:
+            # No ASS: use sub's video (may have burned-in EN subs, e.g. Buggy's Crew, Koby-Meppo)
+            cmd += [
+                "-map", "1:v:0",     # video from sub (burned-in subs if present)
+                "-map", "1:a:0",     # Japanese audio from sub
+                "-map", "0:a:0",     # English audio from dub
+            ]
         if ass_file:
             cmd += ["-map", "2:0"]  # subtitle from ASS file
 
@@ -644,6 +655,7 @@ def mux_episode(  # noqa: C901
         return False
     return True
 
+
 # ---------------------------------------------------------------------------
 # Main processing
 # ---------------------------------------------------------------------------
@@ -707,7 +719,7 @@ def process_arc(arc: ArcConfig, force: bool = False, dry_run: bool = False,  # n
         if ass_file:
             print(f"    Subtitle: {ass_file.name}")
         else:
-            print(f"    [WARN] No subtitle file found for episode {ep_num}")
+            print(f"    [NOTE] No soft subtitle; using sub file video (may have burned-in EN subs)")
             _debug(f"pd filename tried: {sub_pf.name!r}")
 
         if dry_run:
@@ -738,7 +750,7 @@ def process_arc(arc: ArcConfig, force: bool = False, dry_run: bool = False,  # n
                 if download_delay > 0:
                     time.sleep(download_delay)
 
-            # Mux
+            # Mux (when no ASS, mux_episode uses sub's video so burned-in subs are kept)
             temp_output = ep_work / f"{plex_name}.mkv"
             ok = mux_episode(sub_local, dub_local, ass_file, temp_output, dry_run=False, subtitle_lang=subtitle_lang)
             if not ok:

@@ -97,6 +97,10 @@ python3 onepace_mux.py --output-dir "/path/to/One Pace" --list
 
 Not all arcs have every language; coverage varies (e.g. English, German, Portuguese have the widest coverage in Final Subs).
 
+### No soft subtitle (e.g. Buggy's Crew, Koby-Meppo)
+
+For the rare episode where no ASS file is found, the script still downloads the **Sub** and (if available) **Dub** from Pixeldrain. When muxing, it uses the **Sub file's video** (instead of the Dub's) so any **burned-in English subtitles** in that [En Sub] release are kept. So episodes like Buggy's Crew and Koby-Meppo get subs from the Sub file itself; no extra list or config is needed.
+
 ### Font attachment
 
 By default the script attaches a **min** font set (~5.5 MB) from the subtitle repo (Common + Opening + Ending fonts) so ASS styling (signs, karaoke, typesetting) renders correctly in players that use embedded fonts. Use `--full-fonts` to attach the full set including Episode Fonts (~37 MB per file) for maximum compatibility. Use `--no-attach-fonts` to skip font attachment and keep files smaller (ASS may fall back to system fonts and look wrong). Requires **mkvmerge** (MKVToolNix); if not installed, the script skips attachment and warns.
