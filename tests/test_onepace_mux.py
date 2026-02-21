@@ -1,6 +1,7 @@
 """Tests for onepace_mux.py."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import onepace_mux as mux
 
@@ -105,3 +106,106 @@ class TestAttachFontsToMkv:
         assert mux.attach_fonts_to_mkv(
             tmp_path / "out.mkv", [tmp_path / "f.ttf"], dry_run=True
         ) is True
+
+
+class TestFindSubFile:
+    """find_sub_file strategy behavior with temp Final Subs and repo layout."""
+
+    def test_strategy_1_prefix_match(self, tmp_path):
+        """Strategy 1: match by Pixeldrain-style prefix in Final Subs."""
+        final_subs = tmp_path / "Final Subs"
+        final_subs.mkdir(parents=True)
+        (final_subs / "[One Pace][96-97] Jaya 01 [1080p].ass").write_text("")
+        (final_subs / "[One Pace][96-97] Jaya 01 [1080p] Deutsch.ass").write_text("")
+        arc = mux.ARC_BY_SEASON[15]  # Jaya
+        with patch.object(mux, "SUBS_FINAL_DIR", final_subs), patch.object(
+            mux, "SUBS_REPO_DIR", tmp_path
+        ):
+            found = mux.find_sub_file(
+                arc, 1, "[One Pace][96-97] Jaya 01 [1080p].mp4", subtitle_lang="eng"
+            )
+        assert found is not None
+        assert found.name == "[One Pace][96-97] Jaya 01 [1080p].ass"
+
+    def test_strategy_2_arc_ep_match(self, tmp_path):
+        """Strategy 2: match by arc name + episode number."""
+        final_subs = tmp_path / "Final Subs"
+        final_subs.mkdir(parents=True)
+        (final_subs / "[One Pace][98-99] Jaya 02 [1080p].ass").write_text("")
+        arc = mux.ARC_BY_SEASON[15]
+        with patch.object(mux, "SUBS_FINAL_DIR", final_subs), patch.object(
+            mux, "SUBS_REPO_DIR", tmp_path
+        ):
+            found = mux.find_sub_file(
+                arc, 2, "[One Pace][98-99] Jaya 02 [1080p].mp4", subtitle_lang="eng"
+            )
+        assert found is not None
+        assert "02" in found.name and "Jaya" in found.name
+
+    def test_strategy_3_single_arc_file(self, tmp_path):
+        """Strategy 3: single file matching arc name (whole-arc sub)."""
+        final_subs = tmp_path / "Final Subs"
+        final_subs.mkdir(parents=True)
+        (final_subs / "[One Pace] Gaimon [1080p].ass").write_text("")
+        arc = mux.ARC_BY_SEASON[4]  # Gaimon (single-word arc, no apostrophe/space in name)
+        with patch.object(mux, "SUBS_FINAL_DIR", final_subs), patch.object(
+            mux, "SUBS_REPO_DIR", tmp_path
+        ):
+            found = mux.find_sub_file(
+                arc, 1, "Some other filename 01 [1080p].mp4", subtitle_lang="eng"
+            )
+        assert found is not None
+        assert "Gaimon" in found.name
+
+    def test_strategy_4_arc_folder_episode_dir(self, tmp_path):
+        """Strategy 4: fall back to arc folder / episode number / lang .ass."""
+        main_dir = tmp_path / "main"
+        (main_dir / "15 Jaya" / "01").mkdir(parents=True)
+        (main_dir / "15 Jaya" / "01" / "jaya 01 en.ass").write_text("")
+        arc = mux.ARC_BY_SEASON[15]
+        with patch.object(mux, "SUBS_FINAL_DIR", tmp_path / "empty"), patch.object(
+            mux, "SUBS_REPO_DIR", tmp_path
+        ):
+            (tmp_path / "empty").mkdir(exist_ok=True)
+            found = mux.find_sub_file(arc, 1, "Jaya 01 [1080p].mp4", subtitle_lang="eng")
+        assert found is not None
+        assert found.name == "jaya 01 en.ass"
+
+    def test_no_match_returns_none(self, tmp_path):
+        """When nothing matches, find_sub_file returns None."""
+        final_subs = tmp_path / "Final Subs"
+        final_subs.mkdir(parents=True)
+        arc = mux.ARC_BY_SEASON[1]
+        with patch.object(mux, "SUBS_FINAL_DIR", final_subs), patch.object(
+            mux, "SUBS_REPO_DIR", tmp_path
+        ):
+            found = mux.find_sub_file(arc, 99, "Unknown 99 [1080p].mp4", subtitle_lang="eng")
+        assert found is None
+
+
+class TestMuxEpisode:
+    """mux_episode behavior."""
+
+    def test_dry_run_returns_true(self, tmp_path):
+        """With dry_run=True, mux_episode returns True without running ffmpeg."""
+        sub_f = tmp_path / "sub.mp4"
+        sub_f.write_bytes(b"fake")
+        out_f = tmp_path / "out.mkv"
+        assert mux.mux_episode(
+            sub_f, None, None, out_f, dry_run=True, subtitle_lang="eng"
+        ) is True
+        assert not out_f.exists()
+
+
+class TestPdDownloadCaching:
+    """pd_download skips re-download when file exists with correct size."""
+
+    def test_returns_early_when_file_exists_with_matching_size(self, tmp_path):
+        """When dest exists and size matches expected_size, no download is attempted."""
+        dest = tmp_path / "cached.mp4"
+        size = 1024
+        dest.write_bytes(b"x" * size)
+        with patch.object(mux, "_urlopen_with_retry") as mock_open:
+            result = mux.pd_download("dummy_id", dest, expected_size=size)
+        assert result == dest
+        mock_open.assert_not_called()

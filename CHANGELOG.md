@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (No unreleased changes yet.)
 
+## [1.1.1] - 2025-02-21
+
+### Added
+
+- **Dependency check with install offer**: At startup the script checks for `ffmpeg` (required) and `mkvmerge` (optional). If missing and stdin is a TTY, it offers to run the platform-appropriate install command (e.g. `sudo apt install ffmpeg`, `brew install ffmpeg` on macOS, Chocolatey/winget on Windows).
+- **`--copy-nfo-only`**: Copy NFO files from one-pace-for-plex into the output dir and exit (no download/mux). Use after updating the submodule to refresh NFOs for all or selected seasons.
+- **Retry with exponential backoff**: Pixeldrain list and download requests retry up to 3 times (2s, 4s delays) on failure.
+- **Request timeout**: All Pixeldrain HTTP requests use a 30-second timeout to avoid indefinite hangs.
+- **Logging**: Replaced `print` with the `logging` module; use `--debug` for verbose output.
+- **Unit tests**: Tests for subtitle lookup strategies, mux dry-run, and download caching (pytest).
+
+### Changed
+
+- **NFO copy timing**: NFOs are now copied when **each season starts** processing (in `process_arc`), not once upfront. Ensures updated submodule content is used and interrupted runs don’t leave later seasons without NFOs.
+- **Work directory**: `WORK_DIR` is created with mode `0o700` when it doesn’t exist.
+- **Subtitle lookup**: `find_sub_file()` refactored into smaller helpers (`_match_sub_by_prefix`, `_match_sub_by_arc_ep`, etc.) for clarity and testability.
+
+### Fixed
+
+- (No bug fixes in this release.)
+
 ## [1.1.0] - 2025-02-21
 
 ### Added
@@ -40,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - FFmpeg output path was incorrectly passed as metadata; now passed as the final output file argument.
 
-[Unreleased]: https://github.com/snoopyh42/one-pace-mux/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/snoopyh42/one-pace-mux/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/snoopyh42/one-pace-mux/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/snoopyh42/one-pace-mux/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/snoopyh42/one-pace-mux/releases/tag/v1.0.0

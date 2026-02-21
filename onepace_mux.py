@@ -17,7 +17,9 @@ Requires: ffmpeg; mkvmerge (MKVToolNix) for font attachment (optional, will skip
 import argparse
 import base64
 import json
+import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -28,6 +30,14 @@ import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+# Request timeout (seconds) for Pixeldrain API and downloads
+PD_REQUEST_TIMEOUT = 30
+# Retry attempts and base delay for exponential backoff (seconds)
+PD_RETRY_ATTEMPTS = 3
+PD_RETRY_BASE_DELAY = 2
+
+log = logging.getLogger("onepace_mux")
 
 # ---------------------------------------------------------------------------
 # Configuration (overridable via environment or --output-dir)
@@ -48,9 +58,9 @@ AC3_BITRATE = "192k"
 DEBUG = False
 
 
-def _debug(msg: str) -> None:
+def _debug(msg: str, *args: object) -> None:
     if DEBUG:
-        print(f"  [DEBUG] {msg}")
+        log.debug(msg, *args)
 
 
 # Subtitle language: (Final Subs filename suffix before .ass, arc-folder suffix e.g. "en.ass")
@@ -154,6 +164,99 @@ ARC_BY_SEASON = {a.season: a for a in ARCS}
 
 
 # ---------------------------------------------------------------------------
+# Dependency check (ffmpeg required; mkvmerge optional for font attachment)
+# ---------------------------------------------------------------------------
+
+def _get_install_command(tool: str) -> Optional[list[str]]:  # noqa: C901
+    """Return the shell command to install the given tool, or None if unknown.
+    tool is 'ffmpeg' or 'mkvmerge' (mkvtoolnix package).
+    """
+    system = platform.system()
+    if system == "Linux":
+        # Prefer apt-get (Debian/Ubuntu), then dnf (Fedora), pacman (Arch), zypper (openSUSE)
+        if shutil.which("apt-get"):
+            pkg = "ffmpeg" if tool == "ffmpeg" else "mkvtoolnix"
+            return ["sudo", "apt-get", "install", "-y", pkg]
+        if shutil.which("dnf"):
+            pkg = "ffmpeg" if tool == "ffmpeg" else "mkvtoolnix"
+            return ["sudo", "dnf", "install", "-y", pkg]
+        if shutil.which("pacman"):
+            pkg = "ffmpeg" if tool == "ffmpeg" else "mkvtoolnix"
+            return ["sudo", "pacman", "-S", "--noconfirm", pkg]
+        if shutil.which("zypper"):
+            pkg = "ffmpeg" if tool == "ffmpeg" else "mkvtoolnix"
+            return ["sudo", "zypper", "install", "-y", pkg]
+        return None
+    if system == "Darwin":
+        if shutil.which("brew"):
+            pkg = "ffmpeg" if tool == "ffmpeg" else "mkvtoolnix"
+            return ["brew", "install", pkg]
+        return None
+    if system == "Windows":
+        if shutil.which("choco"):
+            pkg = "ffmpeg" if tool == "ffmpeg" else "mkvtoolnix"
+            return ["choco", "install", "-y", pkg]
+        if shutil.which("winget"):
+            pkg = "ffmpeg" if tool == "ffmpeg" else "GnuWin32.MKVToolNix"
+            return ["winget", "install", "--accept-package-agreements", pkg]
+        return None
+    return None
+
+
+def ensure_dependencies(offer_install: bool = True, dry_run: bool = False) -> None:  # noqa: C901
+    """Check that ffmpeg (required) and mkvmerge (optional) are available.
+    If missing and offer_install is True and stdin is a TTY, offer to run the
+    platform-appropriate install command.
+    """
+    if dry_run:
+        return
+    missing_ffmpeg = not shutil.which("ffmpeg")
+    missing_mkvmerge = not shutil.which("mkvmerge")
+    if not missing_ffmpeg and not missing_mkvmerge:
+        return
+
+    can_prompt = sys.stdin.isatty()
+    if missing_ffmpeg:
+        cmd = _get_install_command("ffmpeg")
+        cmd_str = " ".join(cmd) if cmd else "your package manager"
+        log.error("ffmpeg is required but not found. Install with: %s", cmd_str)
+        if offer_install and can_prompt and cmd:
+            try:
+                reply = input("Attempt to install ffmpeg now? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                reply = "n"
+            if reply == "y" or reply == "yes":
+                log.info("Running: %s", cmd_str)
+                result = subprocess.run(cmd, stdin=sys.stdin)
+                if result.returncode != 0:
+                    log.error("Install command failed (exit %d). Install ffmpeg manually and re-run.", result.returncode)
+                    sys.exit(1)
+                log.info("ffmpeg installed successfully.")
+            else:
+                log.error("ffmpeg is required. Exiting.")
+                sys.exit(1)
+        elif missing_ffmpeg:
+            sys.exit(1)
+
+    if missing_mkvmerge:
+        cmd = _get_install_command("mkvmerge")
+        cmd_str = " ".join(cmd) if cmd else "your package manager (e.g. mkvtoolnix)"
+        log.warning("mkvmerge not found; font attachment will be skipped. Install with: %s", cmd_str)
+        if offer_install and can_prompt and cmd:
+            try:
+                reply = input("Attempt to install mkvtoolnix now? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                reply = "n"
+            if reply == "y" or reply == "yes":
+                log.info("Running: %s", cmd_str)
+                result = subprocess.run(cmd, stdin=sys.stdin)
+                if result.returncode != 0:
+                    log.warning("Install command failed (exit %d). Font attachment will be skipped.", result.returncode)
+                else:
+                    log.info("mkvtoolnix installed successfully.")
+
+
+# ---------------------------------------------------------------------------
 # Pixeldrain helpers
 # ---------------------------------------------------------------------------
 
@@ -165,10 +268,27 @@ class PdFile:
     episode_num: int = 0
 
 
+def _urlopen_with_retry(req: urllib.request.Request, timeout: int = PD_REQUEST_TIMEOUT):
+    """Open URL with timeout and exponential backoff retry."""
+    last_error = None
+    for attempt in range(PD_RETRY_ATTEMPTS):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+            last_error = e
+            if attempt < PD_RETRY_ATTEMPTS - 1:
+                delay = PD_RETRY_BASE_DELAY ** attempt
+                log.warning("  Request failed (attempt %d/%d), retrying in %ds: %s",
+                            attempt + 1, PD_RETRY_ATTEMPTS, delay, e)
+                time.sleep(delay)
+    raise last_error
+
+
 def pd_list_files(list_id: str) -> list[PdFile]:
     """Query Pixeldrain API and return file list for a given list ID."""
     url = f"{PIXELDRAIN_API}/list/{list_id}"
-    with urllib.request.urlopen(url) as resp:
+    req = urllib.request.Request(url)
+    with _urlopen_with_retry(req) as resp:
         data = json.loads(resp.read())
     if not data.get("success", False):
         raise RuntimeError(f"Pixeldrain API error for list {list_id}: {data}")
@@ -194,10 +314,10 @@ def pd_download(file_id: str, dest: Path, expected_size: int = 0) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if dest.exists() and expected_size > 0 and dest.stat().st_size == expected_size:
-        print(f"    [skip] Already downloaded: {dest.name}")
+        log.info("    [skip] Already downloaded: %s", dest.name)
         return dest
 
-    print(f"    Downloading {dest.name} ({expected_size / 1024 / 1024:.1f} MB)...", end="", flush=True)
+    log.info("    Downloading %s (%.1f MB)...", dest.name, expected_size / 1024 / 1024)
     start = time.time()
 
     req = urllib.request.Request(url)
@@ -205,14 +325,22 @@ def pd_download(file_id: str, dest: Path, expected_size: int = 0) -> Path:
         # Pixeldrain: Basic auth with empty username and API key as password
         credentials = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode()).decode()
         req.add_header("Authorization", f"Basic {credentials}")
-    try:
-        resp = urllib.request.urlopen(req)
-    except urllib.error.HTTPError as e:
-        print(f"\r    [ERROR] Download failed: HTTP {e.code} for {dest.name}")
-        raise
-    except urllib.error.URLError as e:
-        print(f"\r    [ERROR] Download failed: {e.reason} for {dest.name}")
-        raise
+
+    last_error = None
+    for attempt in range(PD_RETRY_ATTEMPTS):
+        try:
+            resp = _urlopen_with_retry(req)
+            break
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+            last_error = e
+            if attempt < PD_RETRY_ATTEMPTS - 1:
+                delay = PD_RETRY_BASE_DELAY ** attempt
+                log.warning("    Download failed (attempt %d/%d), retrying in %ds: %s",
+                            attempt + 1, PD_RETRY_ATTEMPTS, delay, e)
+                time.sleep(delay)
+            else:
+                log.error("    [ERROR] Download failed: %s for %s", e, dest.name)
+                raise last_error
 
     with resp, open(dest, "wb") as out:
         total = int(resp.headers.get("Content-Length", 0)) or expected_size
@@ -229,13 +357,14 @@ def pd_download(file_id: str, dest: Path, expected_size: int = 0) -> Path:
             if now - last_print > 2:
                 pct = (downloaded / total * 100) if total else 0
                 speed = downloaded / (now - start) / 1024 / 1024
-                print(f"\r    Downloading {dest.name} ({expected_size / 1024 / 1024:.1f} MB)... "
-                      f"{pct:.0f}% @ {speed:.1f} MB/s", end="", flush=True)
+                log.info("    Downloading %s (%.1f MB)... %.0f%% @ %.1f MB/s",
+                         dest.name, expected_size / 1024 / 1024, pct, speed)
                 last_print = now
 
     elapsed = time.time() - start
     speed = (expected_size or downloaded) / elapsed / 1024 / 1024 if elapsed > 0 else 0
-    print(f"\r    Downloaded {dest.name} ({expected_size / 1024 / 1024:.1f} MB) in {elapsed:.0f}s ({speed:.1f} MB/s)")
+    log.info("    Downloaded %s (%.1f MB) in %.0fs (%.1f MB/s)", dest.name,
+             expected_size / 1024 / 1024, elapsed, speed)
     return dest
 
 # ---------------------------------------------------------------------------
@@ -246,7 +375,7 @@ def pd_download(file_id: str, dest: Path, expected_size: int = 0) -> Path:
 def ensure_subs_repo():
     """Clone or update the subtitle repository."""
     if SUBS_REPO_DIR.exists() and (SUBS_REPO_DIR / ".git").exists():
-        print("  Updating subtitle repository...")
+        log.info("  Updating subtitle repository...")
         result = subprocess.run(
             ["git", "pull", "--ff-only"],
             cwd=SUBS_REPO_DIR,
@@ -255,22 +384,148 @@ def ensure_subs_repo():
             text=True,
         )
         if result.returncode != 0:
-            print(f"[ERROR] Subtitle repo update failed (git pull exited {result.returncode}).")
+            log.error("Subtitle repo update failed (git pull exited %d).", result.returncode)
             if result.stderr:
-                print(result.stderr.strip())
-            print("  Fix the repo (e.g. resolve conflicts) or remove it and re-run so it can clone fresh.")
+                log.error("%s", result.stderr.strip())
+            log.error("  Fix the repo (e.g. resolve conflicts) or remove it and re-run so it can clone fresh.")
             sys.exit(1)
         return
-    print("  Cloning subtitle repository (one-time)...")
+    log.info("  Cloning subtitle repository (one-time)...")
     if SUBS_REPO_DIR.exists():
         shutil.rmtree(SUBS_REPO_DIR)
     subprocess.run(
         ["git", "clone", "--depth", "1", SUBS_REPO_URL, str(SUBS_REPO_DIR)],
         check=True, timeout=300)
-    print("  Subtitle repository ready.")
+    log.info("  Subtitle repository ready.")
 
 
-def find_sub_file(  # noqa: C901
+def _sub_lang_ok(f: Path, want_english: bool, non_english_lang: str, final_suffix: str) -> bool:
+    """Return True if ASS path f passes language filter for Final Subs."""
+    if not f.name.endswith(".ass"):
+        return False
+    if want_english:
+        if re.search(rf'{non_english_lang}\s*\.ass$', f.name, re.IGNORECASE):
+            return False
+        if re.search(rf'{non_english_lang}\s+(Extended|Alternate)', f.name, re.IGNORECASE):
+            return False
+        return True
+    if not f.name.endswith(final_suffix + ".ass"):
+        return False
+    ext_alt = re.search(r'\s+(Extended|Alternate)\s*\.ass$', f.name, re.IGNORECASE)
+    if ext_alt and final_suffix + " Extended" not in f.name and final_suffix + " Alternate" not in f.name:
+        return False
+    return True
+
+
+def _match_sub_by_prefix(
+    prefix: str,
+    final_dir: Path,
+    want_english: bool,
+    non_english_lang: str,
+    final_suffix: str,
+) -> Optional[Path]:
+    """Strategy 1: Match by chapter+arc+number prefix in Final Subs."""
+    for f in final_dir.iterdir():
+        if not _sub_lang_ok(f, want_english, non_english_lang, final_suffix):
+            continue
+        if f.name.startswith(prefix):
+            return f
+    return None
+
+
+def _match_sub_by_arc_ep(
+    arc_name: str,
+    episode_num: int,
+    final_dir: Path,
+    want_english: bool,
+    non_english_lang: str,
+    final_suffix: str,
+) -> Optional[Path]:
+    """Strategy 2: Match by arc name + episode number in Final Subs."""
+    arc_name_pattern = arc_name.replace("'", ".")
+    for f in sorted(final_dir.iterdir()):
+        if not _sub_lang_ok(f, want_english, non_english_lang, final_suffix):
+            continue
+        if re.search(rf'{arc_name_pattern}\s+0*{episode_num}\b', f.name, re.IGNORECASE):
+            return f
+    return None
+
+
+def _match_sub_by_arc_single(
+    arc_name: str,
+    final_dir: Path,
+    want_english: bool,
+    non_english_lang: str,
+    final_suffix: str,
+) -> Optional[Path]:
+    """Strategy 3: Match by arc name only when exactly one file matches (whole-arc sub)."""
+    arc_name_flex = re.sub(r"[-'\s]+", r"[\\s'-]*", re.escape(arc_name))
+    arc_name_re = re.compile(rf'\b{arc_name_flex}\b', re.IGNORECASE)
+    matches = [
+        f for f in sorted(final_dir.iterdir())
+        if _sub_lang_ok(f, want_english, non_english_lang, final_suffix) and arc_name_re.search(f.name)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _match_sub_by_folder_desc(
+    arc_folder: str,
+    final_dir: Path,
+    want_english: bool,
+    non_english_lang: str,
+    final_suffix: str,
+) -> Optional[Path]:
+    """Strategy 3b: Match by arc_folder description only when exactly one file matches."""
+    folder_desc = re.sub(r"^\d+\s+", "", arc_folder).strip()
+    if not folder_desc:
+        return None
+    desc_flex = re.sub(r"[-'\s]+", r"[\\s'-]*", re.escape(folder_desc))
+    desc_re = re.compile(rf'\b{desc_flex}\b', re.IGNORECASE)
+    matches = [
+        f for f in sorted(final_dir.iterdir())
+        if _sub_lang_ok(f, want_english, non_english_lang, final_suffix) and desc_re.search(f.name)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _match_sub_by_arc_folder(  # noqa: C901
+    arc: ArcConfig,
+    episode_num: int,
+    arc_suffix: str,
+    subs_repo_dir: Path,
+) -> Optional[Path]:
+    """Strategy 4: Fall back to arc episode folder in repo (e.g. 14 Skypiea/24/skypiea 24 en.ass)."""
+    main_dir = subs_repo_dir / "main"
+    if not main_dir.exists():
+        return None
+    arc_folder_candidates = []
+    if arc.arc_folder and (main_dir / arc.arc_folder).exists():
+        arc_folder_candidates.append(arc.arc_folder)
+    arc_name_simple = arc.name.replace("'", "").replace("-", " ")
+    for d in main_dir.iterdir():
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        if arc.name in d.name or arc_name_simple in d.name.replace("-", " "):
+            if d.name not in arc_folder_candidates:
+                arc_folder_candidates.append(d.name)
+    for folder_name in arc_folder_candidates:
+        arc_dir = main_dir / folder_name / f"{episode_num:02d}"
+        if not arc_dir.exists():
+            arc_dir = main_dir / folder_name / str(episode_num)
+        if not arc_dir.exists():
+            continue
+        candidates = [
+            f for f in sorted(arc_dir.iterdir())
+            if f.name.endswith(f" {arc_suffix}.ass")
+        ]
+        if not candidates:
+            continue
+        non_alt = [f for f in candidates if "alternate" not in f.name.lower()]
+        return non_alt[0] if non_alt else candidates[0]
+    return None
+
+
+def find_sub_file(
     arc: ArcConfig, episode_num: int, pd_filename: str, subtitle_lang: str = "eng"
 ) -> Optional[Path]:
     """Find the matching ASS subtitle file for an episode in the requested language.
@@ -284,127 +539,47 @@ def find_sub_file(  # noqa: C901
     """
     lang_key = subtitle_lang.strip().lower()
     final_suffix, arc_suffix = SUBTITLE_LANGS.get(lang_key, ("", "en"))
-    # English = no suffix in Final Subs; must end with [resolution].ass not *Language.ass
     want_english = final_suffix == ""
-    # Pattern to skip non-English language variants when want_english (include Polish; repo uses "Polish.ass")
     non_english_lang = r'(Deutsch|Arabic|Italian|Portugues|French|Spanish|Turkish|Russian|Polish)'
 
-    # Extract the common prefix: [One Pace][chapters] ArcName NN
     base_match = re.match(r'(\[One Pace\]\[.*?\]\s+\S+.*?\s+\d+)', pd_filename)
 
-    # Strategy 1: Match by the chapter+arc+number prefix in Final Subs
     if base_match:
-        prefix = base_match.group(1)
-        for f in SUBS_FINAL_DIR.iterdir():
-            if not f.name.endswith(".ass"):
-                continue
-            if want_english:
-                if re.search(rf'{non_english_lang}\s*\.ass$', f.name, re.IGNORECASE):
-                    continue
-                if re.search(rf'{non_english_lang}\s+(Extended|Alternate)', f.name, re.IGNORECASE):
-                    continue
-            else:
-                if not f.name.endswith(final_suffix + ".ass"):
-                    continue
-                ext_alt = re.search(r'\s+(Extended|Alternate)\s*\.ass$', f.name, re.IGNORECASE)
-                if ext_alt and final_suffix + " Extended" not in f.name and final_suffix + " Alternate" not in f.name:
-                    continue
-            if f.name.startswith(prefix):
-                _debug(f"sub Strategy 1 (prefix): {f.name}")
-                return f
+        found = _match_sub_by_prefix(
+            base_match.group(1), SUBS_FINAL_DIR, want_english, non_english_lang, final_suffix
+        )
+        if found:
+            _debug("sub Strategy 1 (prefix): %s", found.name)
+            return found
 
-    # Strategy 2: Match by arc name pattern + episode number in Final Subs
-    arc_name_pattern = arc.name.replace("'", ".")
-    for f in sorted(SUBS_FINAL_DIR.iterdir()):
-        if not f.name.endswith(".ass"):
-            continue
-        if want_english:
-            if re.search(non_english_lang, f.name, re.IGNORECASE):
-                continue
-        else:
-            if not f.name.endswith(final_suffix + ".ass"):
-                continue
-        ep_match = re.search(rf'{arc_name_pattern}\s+0*{episode_num}\b', f.name, re.IGNORECASE)
-        if ep_match:
-            _debug(f"sub Strategy 2 (arc+ep): {f.name}")
-            return f
+    found = _match_sub_by_arc_ep(
+        arc.name, episode_num, SUBS_FINAL_DIR, want_english, non_english_lang, final_suffix
+    )
+    if found:
+        _debug("sub Strategy 2 (arc+ep): %s", found.name)
+        return found
 
-    # Strategy 3: Match by arc name only when there is exactly one such file (whole-arc sub, e.g. Buggy's Crew).
-    # If multiple files match (e.g. Alabasta 01, 02, 03...), do not use this — we'd wrongly reuse one ep's subs.
-    arc_name_flex = re.sub(r"[-'\s]+", r"[\\s'-]*", re.escape(arc.name))
-    arc_name_re = re.compile(rf'\b{arc_name_flex}\b', re.IGNORECASE)
-    strategy3_matches = []
-    for f in sorted(SUBS_FINAL_DIR.iterdir()):
-        if not f.name.endswith(".ass"):
-            continue
-        if want_english:
-            if re.search(non_english_lang, f.name, re.IGNORECASE):
-                continue
-        else:
-            if not f.name.endswith(final_suffix + ".ass"):
-                continue
-        if arc_name_re.search(f.name):
-            strategy3_matches.append(f)
-    if len(strategy3_matches) == 1:
-        _debug(f"sub Strategy 3 (arc name, single file): {strategy3_matches[0].name}")
-        return strategy3_matches[0]
+    found = _match_sub_by_arc_single(
+        arc.name, SUBS_FINAL_DIR, want_english, non_english_lang, final_suffix
+    )
+    if found:
+        _debug("sub Strategy 3 (arc name, single file): %s", found.name)
+        return found
 
-    # Strategy 3b: Match by arc_folder description only when exactly one file matches (e.g. "If You Could Go Anywhere")
-    # If multiple match (e.g. "Alabasta" matches Alabasta 01, 02, ...), do not use — would reuse wrong ep's subs.
     if arc.arc_folder:
-        folder_desc = re.sub(r"^\d+\s+", "", arc.arc_folder).strip()
-        if folder_desc:
-            desc_flex = re.sub(r"[-'\s]+", r"[\\s'-]*", re.escape(folder_desc))
-            desc_re = re.compile(rf'\b{desc_flex}\b', re.IGNORECASE)
-            strategy3b_matches = []
-            for f in sorted(SUBS_FINAL_DIR.iterdir()):
-                if not f.name.endswith(".ass"):
-                    continue
-                if want_english:
-                    if re.search(non_english_lang, f.name, re.IGNORECASE):
-                        continue
-                else:
-                    if not f.name.endswith(final_suffix + ".ass"):
-                        continue
-                if desc_re.search(f.name):
-                    strategy3b_matches.append(f)
-            if len(strategy3b_matches) == 1:
-                _debug(f"sub Strategy 3b (arc_folder desc, single file): {strategy3b_matches[0].name}")
-                return strategy3b_matches[0]
+        found = _match_sub_by_folder_desc(
+            arc.arc_folder, SUBS_FINAL_DIR, want_english, non_english_lang, final_suffix
+        )
+        if found:
+            _debug("sub Strategy 3b (arc_folder desc, single file): %s", found.name)
+            return found
 
-    # Strategy 4: Fall back to arc episode folder (e.g. "14 Skypiea/24/skypiea 24 en.ass")
-    # Script arc_folder may use season numbering (e.g. "14 Alabasta"); repo may use different (e.g. "12 Alabasta")
-    main_dir = SUBS_REPO_DIR / "main"
-    if main_dir.exists():
-        arc_folder_candidates = []
-        if arc.arc_folder and (main_dir / arc.arc_folder).exists():
-            arc_folder_candidates.append(arc.arc_folder)
-        # If configured folder missing, find a folder whose name contains the arc name (e.g. "12 Alabasta")
-        arc_name_simple = arc.name.replace("'", "").replace("-", " ")
-        for d in main_dir.iterdir():
-            if not d.is_dir() or d.name.startswith("."):
-                continue
-            if arc.name in d.name or arc_name_simple in d.name.replace("-", " "):
-                if d.name not in arc_folder_candidates:
-                    arc_folder_candidates.append(d.name)
-        _debug(f"Strategy 4 arc_folder candidates: {arc_folder_candidates}")
-        for folder_name in arc_folder_candidates:
-            arc_dir = main_dir / folder_name / f"{episode_num:02d}"
-            if not arc_dir.exists():
-                arc_dir = main_dir / folder_name / str(episode_num)
-            if arc_dir.exists():
-                candidates = []
-                for f in sorted(arc_dir.iterdir()):
-                    if not f.name.endswith(f" {arc_suffix}.ass"):
-                        continue
-                    candidates.append(f)
-                if candidates:
-                    non_alt = [f for f in candidates if "alternate" not in f.name.lower()]
-                    chosen = non_alt[0] if non_alt else candidates[0]
-                    _debug(f"sub Strategy 4 (arc folder {folder_name!r}): {chosen.name}")
-                    return chosen
+    found = _match_sub_by_arc_folder(arc, episode_num, arc_suffix, SUBS_REPO_DIR)
+    if found:
+        _debug("sub Strategy 4 (arc folder): %s", found.name)
+        return found
 
-    _debug(f"no sub (arc={arc.name!r} ep={episode_num} pd={pd_filename!r})")
+    _debug("no sub (arc=%r ep=%s pd=%r)", arc.name, episode_num, pd_filename)
     return None
 
 # ---------------------------------------------------------------------------
@@ -513,7 +688,7 @@ def attach_fonts_to_mkv(mkv_path: Path, font_files: list[Path], dry_run: bool = 
         return True
     mkvmerge = shutil.which("mkvmerge")
     if not mkvmerge:
-        print("    [WARN] mkvmerge not found (MKVToolNix); skipping font attachment.")
+        log.warning("    mkvmerge not found (MKVToolNix); skipping font attachment.")
         return True
     out_temp = mkv_path.with_suffix(".mkv.fonts_tmp")
     # MIME: TTF = font/ttf or application/x-truetype-font, OTF = font/otf
@@ -522,17 +697,17 @@ def attach_fonts_to_mkv(mkv_path: Path, font_files: list[Path], dry_run: bool = 
         mime = "application/x-truetype-font" if f.suffix.lower() == ".ttf" else "font/otf"
         args += ["--attachment-mime-type", mime, "--attach-file", str(f)]
     if dry_run:
-        print(f"    [dry-run] Would attach {len(font_files)} font(s) with mkvmerge")
+        log.info("    [dry-run] Would attach %d font(s) with mkvmerge", len(font_files))
         return True
-    print(f"    Attaching {len(font_files)} font(s)...")
+    log.info("    Attaching %d font(s)...", len(font_files))
     result = subprocess.run(args, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"    [ERROR] mkvmerge failed:\n{result.stderr}")
+        log.error("    mkvmerge failed:\n%s", result.stderr)
         return False
     try:
         out_temp.replace(mkv_path)
     except OSError as e:
-        print(f"    [ERROR] Could not replace MKV with font-attached version: {e}")
+        log.error("    Could not replace MKV with font-attached version: %s", e)
         return False
     return True
 
@@ -645,13 +820,13 @@ def mux_episode(  # noqa: C901
     cmd += ["-metadata", f"title={container_title}", str(output_file)]
 
     if dry_run:
-        print(f"    [dry-run] Would run: {' '.join(cmd)}")
+        log.info("    [dry-run] Would run: %s", " ".join(cmd))
         return True
 
-    print(f"    Muxing to {output_file.name}...")
+    log.info("    Muxing to %s...", output_file.name)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"    [ERROR] ffmpeg failed:\n{result.stderr}")
+        log.error("    ffmpeg failed:\n%s", result.stderr)
         return False
     return True
 
@@ -668,21 +843,26 @@ def process_arc(arc: ArcConfig, force: bool = False, dry_run: bool = False,  # n
     season_dir = ONEPACE_DIR / f"Season {arc.season}"
     season_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n{'='*70}")
-    print(f"Processing: {arc.name} (Season {arc.season})")
-    print(f"{'='*70}")
-    _debug(f"SUBS_FINAL_DIR={SUBS_FINAL_DIR} arc_folder={arc.arc_folder!r}")
+    # Copy NFOs for this season when we start (so names are correct and submodule can be updated between runs)
+    nfo_source = get_nfo_source_dir()
+    if nfo_source:
+        copy_nfo_files_for_seasons(nfo_source, ONEPACE_DIR, [arc.season], dry_run=dry_run)
+
+    log.info("\n%s", "=" * 70)
+    log.info("Processing: %s (Season %d)", arc.name, arc.season)
+    log.info("%s", "=" * 70)
+    _debug("SUBS_FINAL_DIR=%s arc_folder=%r", SUBS_FINAL_DIR, arc.arc_folder)
 
     # Fetch file lists from Pixeldrain
-    print(f"  Querying Pixeldrain for Sub files (list: {arc.sub_id})...")
+    log.info("  Querying Pixeldrain for Sub files (list: %s)...", arc.sub_id)
     sub_files = pd_list_files(arc.sub_id)
-    print(f"  Found {len(sub_files)} Sub episodes")
+    log.info("  Found %d Sub episodes", len(sub_files))
 
     dub_files = []
     if arc.dub_id:
-        print(f"  Querying Pixeldrain for Dub files (list: {arc.dub_id})...")
+        log.info("  Querying Pixeldrain for Dub files (list: %s)...", arc.dub_id)
         dub_files = pd_list_files(arc.dub_id)
-        print(f"  Found {len(dub_files)} Dub episodes")
+        log.info("  Found %d Dub episodes", len(dub_files))
 
     dub_by_ep = {f.episode_num: f for f in dub_files}
 
@@ -693,22 +873,22 @@ def process_arc(arc: ArcConfig, force: bool = False, dry_run: bool = False,  # n
     for sub_pf in sub_files:
         ep_num = sub_pf.episode_num
         if ep_num == 0:
-            print(f"  [WARN] Could not determine episode number for: {sub_pf.name}")
+            log.warning("  Could not determine episode number for: %s", sub_pf.name)
             error_count += 1
             continue
 
         plex_name = get_plex_name(season_dir, ep_num)
         if not plex_name:
-            print(f"  [WARN] No NFO found for S{arc.season:02d}E{ep_num:02d}, using fallback name")
+            log.warning("  No NFO found for S%02dE%02d, using fallback name", arc.season, ep_num)
             plex_name = f"One Pace - S{arc.season:02d}E{ep_num:02d} - {arc.name} {ep_num:02d}"
 
         output_mkv = season_dir / f"{plex_name}.mkv"
 
-        print(f"\n  Episode {ep_num:02d}: {plex_name}")
+        log.info("\n  Episode %02d: %s", ep_num, plex_name)
 
         # Check if already done
         if output_mkv.exists() and not force:
-            print(f"    [skip] Already exists: {output_mkv.name}")
+            log.info("    [skip] Already exists: %s", output_mkv.name)
             skip_count += 1
             continue
 
@@ -717,16 +897,16 @@ def process_arc(arc: ArcConfig, force: bool = False, dry_run: bool = False,  # n
         # Find subtitle file
         ass_file = find_sub_file(arc, ep_num, sub_pf.name, subtitle_lang=subtitle_lang)
         if ass_file:
-            print(f"    Subtitle: {ass_file.name}")
+            log.info("    Subtitle: %s", ass_file.name)
         else:
-            print(f"    [NOTE] No soft subtitle; using sub file video (may have burned-in EN subs)")
-            _debug(f"pd filename tried: {sub_pf.name!r}")
+            log.info("    [NOTE] No soft subtitle; using sub file video (may have burned-in EN subs)")
+            _debug("pd filename tried: %r", sub_pf.name)
 
         if dry_run:
-            print(f"    [dry-run] Would download Sub: {sub_pf.name} ({sub_pf.size/1024/1024:.1f} MB)")
+            log.info("    [dry-run] Would download Sub: %s (%.1f MB)", sub_pf.name, sub_pf.size / 1024 / 1024)
             if dub_pf:
-                print(f"    [dry-run] Would download Dub: {dub_pf.name} ({dub_pf.size/1024/1024:.1f} MB)")
-            print(f"    [dry-run] Would mux to: {output_mkv.name}")
+                log.info("    [dry-run] Would download Dub: %s (%.1f MB)", dub_pf.name, dub_pf.size / 1024 / 1024)
+            log.info("    [dry-run] Would mux to: %s", output_mkv.name)
             success_count += 1
             continue
 
@@ -772,31 +952,32 @@ def process_arc(arc: ArcConfig, force: bool = False, dry_run: bool = False,  # n
             if backup_dir and old_mp4.exists():
                 bk = backup_dir / f"Season {arc.season}"
                 bk.mkdir(parents=True, exist_ok=True)
-                print(f"    Backing up old file to {bk / old_mp4.name}")
+                log.info("    Backing up old file to %s", bk / old_mp4.name)
                 shutil.move(str(old_mp4), str(bk / old_mp4.name))
             elif old_mp4.exists():
-                print(f"    Removing old file: {old_mp4.name}")
+                log.info("    Removing old file: %s", old_mp4.name)
                 old_mp4.unlink()
 
-            print(f"    Moving {temp_output.name} to {season_dir}")
+            log.info("    Moving %s to %s", temp_output.name, season_dir)
             shutil.move(str(temp_output), str(output_mkv))
 
             out_size = output_mkv.stat().st_size / 1024 / 1024
-            print(f"    Done! Final size: {out_size:.1f} MB")
+            log.info("    Done! Final size: %.1f MB", out_size)
             success_count += 1
             move_succeeded = True
 
         except Exception as e:
-            print(f"    [ERROR] {e}")
+            log.error("    %s", e)
             error_count += 1
         finally:
             # Clean up work dir only if move succeeded (otherwise muxed file is only in ep_work)
             if ep_work.exists() and move_succeeded:
                 shutil.rmtree(ep_work)
             elif ep_work.exists() and not move_succeeded:
-                print(f"    [NOTE] Left work dir {ep_work} (move failed; muxed file may be there)")
+                log.info("    [NOTE] Left work dir %s (move failed; muxed file may be there)", ep_work)
 
-    print(f"\n  Summary for {arc.name}: {success_count} success, {skip_count} skipped, {error_count} errors")
+    log.info("\n  Summary for %s: %d success, %d skipped, %d errors",
+             arc.name, success_count, skip_count, error_count)
     return error_count == 0
 
 # ---------------------------------------------------------------------------
@@ -828,6 +1009,8 @@ Examples:
     parser.add_argument("--subtitle-lang", type=str, default="eng",
                         help="Subtitle language: eng, deu, por, ara, ita, fra, spa, tur, rus (default: eng)")
     parser.add_argument("--list", action="store_true", help="List all arcs and their status")
+    parser.add_argument("--copy-nfo-only", action="store_true",
+                        help="Only copy NFO files from one-pace-for-plex into output dir, then exit (no download/mux). Use after updating submodule to fix missing NFOs.")
     parser.add_argument("--debug", action="store_true", help="Print extra debug (e.g. subtitle lookup strategy, paths)")
     parser.add_argument("--download-delay", type=float, default=0, metavar="SECS",
                         help="Pause SECS between downloads (0=no delay). Spreads load under free-tier 6 GB/24h.")
@@ -841,9 +1024,15 @@ Examples:
     global DEBUG
     DEBUG = bool(args.debug)
 
+    logging.basicConfig(
+        level=logging.DEBUG if DEBUG else logging.INFO,
+        format="%(message)s",
+        stream=sys.stdout,
+    )
+
     if args.subtitle_lang and args.subtitle_lang.strip().lower() not in SUBTITLE_LANGS:
-        print(f"[ERROR] Unknown subtitle language: {args.subtitle_lang}")
-        print("  Supported: eng, deu/de, por/pt, ara/ar, ita/it, fra/fr, spa/es, tur/tr, rus/ru")
+        log.error("Unknown subtitle language: %s", args.subtitle_lang)
+        log.error("  Supported: eng, deu/de, por/pt, ara/ar, ita/it, fra/fr, spa/es, tur/tr, rus/ru")
         sys.exit(1)
 
     # Set paths from args and environment
@@ -859,8 +1048,8 @@ Examples:
     SUBS_FINAL_DIR = SUBS_REPO_DIR / "main" / "Release" / "Final Subs"
 
     if args.list:
-        print(f"{'Season':>7}  {'Arc':<30}  {'Sub':>5}  {'Dub':>5}  {'Status'}")
-        print("-" * 75)
+        log.info("%7s  %-30s  %5s  %5s  %s", "Season", "Arc", "Sub", "Dub", "Status")
+        log.info("-" * 75)
         for arc in ARCS:
             season_dir = ONEPACE_DIR / f"Season {arc.season}"
             mkv_count = len(list(season_dir.glob("*.mkv"))) if season_dir.exists() else 0
@@ -872,7 +1061,23 @@ Examples:
                 status = f"Partial ({mkv_count} MKV, {mp4_count} MP4)"
             else:
                 status = f"Pending ({mp4_count} MP4)"
-            print(f"  S{arc.season:02d}    {arc.name:<30}  {arc.sub_res:>5}  {dub_status:>5}  {status}")
+            log.info("  S%02d    %-30s  %5s  %5s  %s", arc.season, arc.name, arc.sub_res, dub_status, status)
+        return
+
+    if args.copy_nfo_only:
+        nfo_source = get_nfo_source_dir()
+        if not nfo_source:
+            log.error("one-pace-for-plex submodule not found. Clone with: git clone --recursive ...")
+            sys.exit(1)
+        copy_seasons = list(range(1, 37)) if args.all else (args.seasons or list(range(1, 37)))
+        for s in copy_seasons:
+            if s not in ARC_BY_SEASON:
+                log.error("Unknown season: %s", s)
+                sys.exit(1)
+        log.info("Copying NFO files from one-pace-for-plex into %s (seasons %s)...",
+                 ONEPACE_DIR, copy_seasons if len(copy_seasons) <= 5 else f"1-36 ({len(copy_seasons)} seasons)")
+        copy_nfo_files_for_seasons(nfo_source, ONEPACE_DIR, copy_seasons, dry_run=False)
+        log.info("Done. NFOs copied for %d season(s).", len(copy_seasons))
         return
 
     if not args.seasons and not args.all:
@@ -884,29 +1089,26 @@ Examples:
     # Validate
     for s in seasons_to_process:
         if s not in ARC_BY_SEASON:
-            print(f"[ERROR] Unknown season: {s}")
+            log.error("Unknown season: %s", s)
             sys.exit(1)
 
-    # Copy episode NFOs from one-pace-for-plex submodule into output dir (so MKVs get proper names)
-    nfo_source = get_nfo_source_dir()
-    if nfo_source:
-        if not args.dry_run:
-            print("  Copying episode NFOs from one-pace-for-plex into output directory...")
-        copy_nfo_files_for_seasons(nfo_source, ONEPACE_DIR, seasons_to_process, dry_run=args.dry_run)
-    else:
-        print("  [NOTE] one-pace-for-plex submodule not found; episode names will use fallback (e.g. Jaya 01).")
-        print("         Clone with: git clone --recursive https://github.com/snoopyh42/one-pace-mux.git")
+    # Check required tools (ffmpeg) and optional (mkvmerge); offer to install if missing
+    ensure_dependencies(offer_install=True, dry_run=args.dry_run)
+
+    if not get_nfo_source_dir():
+        log.info("  [NOTE] one-pace-for-plex submodule not found; episode names will use fallback (e.g. Jaya 01).")
+        log.info("         Clone with: git clone --recursive https://github.com/snoopyh42/one-pace-mux.git")
 
     # Ensure subtitle repo
     ensure_subs_repo()
 
     if not SUBS_FINAL_DIR.is_dir():
-        print(f"[ERROR] Subtitle directory not found: {SUBS_FINAL_DIR}")
-        print("  Expected 'main/Release/Final Subs' inside the subtitle repo. Re-clone or fix ONEPACE_SUBS_DIR.")
+        log.error("Subtitle directory not found: %s", SUBS_FINAL_DIR)
+        log.error("  Expected 'main/Release/Final Subs' inside the subtitle repo. Re-clone or fix ONEPACE_SUBS_DIR.")
         sys.exit(1)
 
-    # Ensure work directory
-    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    # Ensure work directory (restrict permissions when creating)
+    WORK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     total_start = time.time()
     results = {}
@@ -920,12 +1122,12 @@ Examples:
         results[s] = ok
 
     elapsed = time.time() - total_start
-    print(f"\n{'='*70}")
-    print(f"All done! Processed {len(results)} arc(s) in {elapsed/60:.1f} minutes.")
+    log.info("\n%s", "=" * 70)
+    log.info("All done! Processed %d arc(s) in %.1f minutes.", len(results), elapsed / 60)
     for s, ok in results.items():
         arc = ARC_BY_SEASON[s]
         status = "OK" if ok else "ERRORS"
-        print(f"  Season {s:2d} ({arc.name}): {status}")
+        log.info("  Season %2d (%s): %s", s, arc.name, status)
 
 
 if __name__ == "__main__":

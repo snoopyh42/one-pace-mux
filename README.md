@@ -15,10 +15,10 @@ Each output file contains:
 
 ## Requirements
 
-- **Python 3.9+**
-- **ffmpeg** (in your PATH)
+- **Python 3.11+**
+- **ffmpeg** (in your PATH). If missing, the script can offer to install it via your package manager when run interactively.
 - **git** (for recursive clone; or the script will clone the subtitle repo at runtime if the submodule is missing)
-- **mkvmerge** (MKVToolNix) – optional; used to attach subtitle fonts into the MKV. If missing, the script skips font attachment and warns (mux still succeeds; ASS may not render correctly on some players).
+- **mkvmerge** (MKVToolNix) – optional; used to attach subtitle fonts into the MKV. If missing, the script skips font attachment and warns (mux still succeeds; ASS may not render correctly on some players). The script can offer to install it when run interactively.
 
 ## Getting started
 
@@ -79,6 +79,7 @@ python3 onepace_mux.py --output-dir "/path/to/One Pace" --list
 | `--season N` | Process season N (can repeat) |
 | `--all` | Process all seasons |
 | `--list` | Show status (MKV/MP4 counts) per season |
+| `--copy-nfo-only` | Only copy NFO files from one-pace-for-plex into output dir, then exit. Use after updating the submodule to fix missing NFOs (e.g. seasons 23+). |
 | `--dry-run` | Show what would be done, no downloads or writes |
 | `--force` | Overwrite existing MKV files |
 | `--backup-dir PATH` | Move old MP4s here instead of deleting |
@@ -114,13 +115,14 @@ pip install pytest
 pytest
 ```
 
-CI (GitHub Actions) runs lint (flake8) and tests on push and pull request to `main` for Python 3.9, 3.10, and 3.11.
+CI (GitHub Actions) runs lint (flake8) and tests on push and pull request to `main` for Python 3.11, 3.12, and 3.13 (Ubuntu, macOS, Windows).
 
 ### Troubleshooting
 
 - **"can't open file 'onepace_mux.py'"** — You're not in the repo directory. Run `cd one-pace-mux` first, or use the full path to the script.
 - **"unrecognized arguments" when using `--output-dir`** — Your path contains spaces; put it in quotes: `--output-dir "/path/to/One Pace"`.
 - **Episode names like "Jaya 01" instead of full titles** — You didn't clone with submodules. Run `git clone --recursive ...` or, if already cloned, `git submodule update --init --recursive`.
+- **NFOs missing for some seasons** — The script copies NFOs when **each season starts** processing. If the one-pace-for-plex submodule was updated after a run (e.g. it only had seasons 1–22 when you ran, and you later pulled 23–36), re-run for the missing seasons and they will get NFOs as they are processed. To refresh NFOs without downloading/muxing, run `python3 onepace_mux.py --output-dir "/path/to/One Pace" --copy-nfo-only --all`.
 - **ffmpeg or mux errors** — Ensure `ffmpeg` is installed and on your PATH (`which ffmpeg`).
 - **"mkvmerge not found; skipping font attachment"** — Optional. Install MKVToolNix for your OS so `mkvmerge` is on your PATH if you want fonts embedded; otherwise the script still muxes, but ASS may not render correctly on some players.
 - **Downloads very slow or "speed limited"** — Pixeldrain’s free tier has a **6 GB per 24 hours** (sliding window) limit per IP. Once you exceed it, they throttle download speed. Options: wait for the window to roll off, use a different network/VPN (new IP), or use Pixeldrain premium. You can also use `--download-delay N` to space downloads and spread usage over time.
@@ -128,7 +130,7 @@ CI (GitHub Actions) runs lint (flake8) and tests on push and pull request to `ma
 
 ## Folder structure
 
-Your `--output-dir` will contain `Season 1/` … `Season 36/`. When you use the recommended workflow (clone with `--recursive`), the script copies episode NFOs from the submodule into these season folders, then writes MKVs with matching names (e.g. `One Pace - S15E01 - Why the Log Pose Is Spherical.mkv`). The script downloads from Pixeldrain (onepace.net links), matches episodes by season/episode number, and writes MKVs alongside the NFOs. Existing MP4s are removed unless you use `--backup-dir`.
+Your `--output-dir` will contain `Season 1/` … `Season 36/`. When you use the recommended workflow (clone with `--recursive`), the script copies episode NFOs from the submodule **when each season starts processing**, then writes MKVs with matching names (e.g. `One Pace - S15E01 - Why the Log Pose Is Spherical.mkv`). The script downloads from Pixeldrain (onepace.net links), matches episodes by season/episode number, and writes MKVs alongside the NFOs. Existing MP4s are removed unless you use `--backup-dir`.
 
 ## Credits and disclaimer
 
