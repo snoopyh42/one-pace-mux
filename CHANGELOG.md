@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - (No bug fixes in this release.)
 
+### Documentation
+
+- **Sudo/admin clarification**: Docstrings and README now state that on Linux the dependency install command uses sudo and that administrative access is only needed if the user accepts the install offer. Test docstring notes that installs are mocked and no sudo/admin is required to run tests.
+
 ## [1.1.0] - 2025-02-21
 
 ### Added

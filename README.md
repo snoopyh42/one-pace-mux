@@ -16,7 +16,7 @@ Each output file contains:
 ## Requirements
 
 - **Python 3.11+**
-- **ffmpeg** (in your PATH). If missing, the script can offer to install it via your package manager when run interactively.
+- **ffmpeg** (in your PATH). If missing, the script can offer to install it via your package manager when run interactively (on Linux this uses sudo; you need administrative access only if you accept the install).
 - **git** (for recursive clone; or the script will clone the subtitle repo at runtime if the submodule is missing)
 - **mkvmerge** (MKVToolNix) – optional; used to attach subtitle fonts into the MKV. If missing, the script skips font attachment and warns (mux still succeeds; ASS may not render correctly on some players). The script can offer to install it when run interactively.
 

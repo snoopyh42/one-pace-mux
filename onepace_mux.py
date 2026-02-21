@@ -206,7 +206,8 @@ def _get_install_command(tool: str) -> Optional[list[str]]:  # noqa: C901
 def ensure_dependencies(offer_install: bool = True, dry_run: bool = False) -> None:  # noqa: C901
     """Check that ffmpeg (required) and mkvmerge (optional) are available.
     If missing and offer_install is True and stdin is a TTY, offer to run the
-    platform-appropriate install command.
+    platform-appropriate install command. On Linux the command uses sudo;
+    administrative access is only needed if you accept the install offer.
     """
     if dry_run:
         return

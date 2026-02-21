@@ -1,7 +1,7 @@
 """Tests for onepace_mux.py."""
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import onepace_mux as mux
 
@@ -209,3 +209,112 @@ class TestPdDownloadCaching:
             result = mux.pd_download("dummy_id", dest, expected_size=size)
         assert result == dest
         mock_open.assert_not_called()
+
+
+class TestGetInstallCommand:
+    """_get_install_command returns correct command per platform and tool."""
+
+    def test_linux_apt_ffmpeg(self):
+        with patch("onepace_mux.platform.system", return_value="Linux"), patch(
+            "onepace_mux.shutil.which", side_effect=lambda c: c == "apt-get"
+        ):
+            assert mux._get_install_command("ffmpeg") == ["sudo", "apt-get", "install", "-y", "ffmpeg"]
+
+    def test_linux_apt_mkvmerge(self):
+        with patch("onepace_mux.platform.system", return_value="Linux"), patch(
+            "onepace_mux.shutil.which", side_effect=lambda c: c == "apt-get"
+        ):
+            assert mux._get_install_command("mkvmerge") == ["sudo", "apt-get", "install", "-y", "mkvtoolnix"]
+
+    def test_linux_dnf_ffmpeg(self):
+        with patch("onepace_mux.platform.system", return_value="Linux"), patch(
+            "onepace_mux.shutil.which", side_effect=lambda c: c == "dnf"
+        ):
+            assert mux._get_install_command("ffmpeg") == ["sudo", "dnf", "install", "-y", "ffmpeg"]
+
+    def test_darwin_brew_ffmpeg(self):
+        with patch("onepace_mux.platform.system", return_value="Darwin"), patch(
+            "onepace_mux.shutil.which", side_effect=lambda c: c == "brew"
+        ):
+            assert mux._get_install_command("ffmpeg") == ["brew", "install", "ffmpeg"]
+
+    def test_windows_choco_mkvmerge(self):
+        with patch("onepace_mux.platform.system", return_value="Windows"), patch(
+            "onepace_mux.shutil.which", side_effect=lambda c: c == "choco"
+        ):
+            assert mux._get_install_command("mkvmerge") == ["choco", "install", "-y", "mkvtoolnix"]
+
+    def test_windows_winget_ffmpeg(self):
+        with patch("onepace_mux.platform.system", return_value="Windows"), patch(
+            "onepace_mux.shutil.which", side_effect=lambda c: c == "winget"
+        ):
+            assert mux._get_install_command("ffmpeg") == ["winget", "install", "--accept-package-agreements", "ffmpeg"]
+
+    def test_unknown_platform_returns_none(self):
+        with patch("onepace_mux.platform.system", return_value="Other"):
+            assert mux._get_install_command("ffmpeg") is None
+
+
+class TestEnsureDependencies:
+    """ensure_dependencies with install offer; tests assume 'yes' for install prompt.
+    All installs are mocked (subprocess.run); no sudo or admin access required to run tests.
+    """
+
+    def test_dry_run_skips_all_checks(self):
+        """With dry_run=True, ensure_dependencies returns without checking or prompting."""
+        with patch("onepace_mux.shutil.which", return_value=None):
+            mux.ensure_dependencies(offer_install=True, dry_run=True)
+        # No input/subprocess should be called; which may or may not be called
+        # (implementation may short-circuit on dry_run before which). Either way we didn't exit.
+
+    def test_ffmpeg_missing_user_says_yes_runs_install(self):
+        """When ffmpeg is missing and user answers yes, subprocess.run is called with install command."""
+        def which(c):
+            # ffmpeg missing (so we prompt); mkvmerge present; apt-get present for _get_install_command
+            if c == "apt-get":
+                return "/usr/bin/apt-get"
+            if c == "mkvmerge":
+                return "/usr/bin/mkvmerge"
+            return None
+
+        with (
+            patch("onepace_mux.shutil.which", side_effect=which),
+            patch("onepace_mux.platform.system", return_value="Linux"),
+            patch("sys.stdin.isatty", return_value=True),
+            patch("builtins.input", return_value="y"),
+            patch("onepace_mux.subprocess.run", return_value=MagicMock(returncode=0)) as mock_run,
+        ):
+            mux.ensure_dependencies(offer_install=True, dry_run=False)
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
+            assert args == ["sudo", "apt-get", "install", "-y", "ffmpeg"]
+
+    def test_ffmpeg_missing_user_says_no_exits(self):
+        """When ffmpeg is missing and user answers no, sys.exit(1) is called."""
+        def which(c):
+            if c == "apt-get":
+                return "/usr/bin/apt-get"
+            if c == "mkvmerge":
+                return "/usr/bin/mkvmerge"
+            return None
+
+        with (
+            patch("onepace_mux.shutil.which", side_effect=which),
+            patch("onepace_mux.platform.system", return_value="Linux"),
+            patch("sys.stdin.isatty", return_value=True),
+            patch("builtins.input", return_value="n"),
+            patch("onepace_mux.sys.exit") as mock_exit,
+        ):
+            mux.ensure_dependencies(offer_install=True, dry_run=False)
+            mock_exit.assert_called_once_with(1)
+
+    def test_both_present_returns_immediately(self):
+        """When ffmpeg and mkvmerge are present, no prompt and no subprocess."""
+        with (
+            patch("onepace_mux.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("builtins.input") as mock_input,
+            patch("onepace_mux.subprocess.run") as mock_run,
+        ):
+            mux.ensure_dependencies(offer_install=True, dry_run=False)
+            mock_input.assert_not_called()
+            mock_run.assert_not_called()
