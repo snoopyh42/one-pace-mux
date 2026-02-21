@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (No unreleased changes yet.)
 
+## [1.1.0] - 2025-02-21
+
+### Added
+
+- **Container title**: MKV container title is set to the episode name (e.g. Plex episode title) so players and Plex show a proper title instead of the filename.
+- **Font attachment**: Subtitle fonts from the one-pace-public-subtitles repo are attached to each MKV via mkvmerge (MKVToolNix) so ASS styling (signs, karaoke, typesetting) renders correctly. Default uses a **min** set (~5.5 MB): Common + Opening + Ending fonts only.
+- **`--full-fonts`**: Attach the full font set including Episode Fonts (~37 MB per file) for maximum compatibility with all episode-specific styling.
+- **`--no-attach-fonts`**: Disable font attachment for smaller files (ASS may not render correctly on some players).
+- README: Font attachment section, mkvmerge requirement (optional), new options and troubleshooting.
+
+### Changed
+
+- Font attachment is optional: if mkvmerge is not found, the script warns and skips attachment instead of failing.
+
 ## [1.0.0] - 2025-02-20
 
 ### Added
@@ -26,5 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - FFmpeg output path was incorrectly passed as metadata; now passed as the final output file argument.
 
-[Unreleased]: https://github.com/snoopyh42/one-pace-mux/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/snoopyh42/one-pace-mux/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/snoopyh42/one-pace-mux/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/snoopyh42/one-pace-mux/releases/tag/v1.0.0

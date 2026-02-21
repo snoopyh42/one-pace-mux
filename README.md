@@ -10,12 +10,15 @@ Each output file contains:
 - **Audio 1**: Japanese, AC3 192 kbps (default)
 - **Audio 2**: English dub, AC3 192 kbps (where available)
 - **Subtitles**: ASS in your chosen language (default: English; optional: German, Portuguese, Arabic, Italian, French, Spanish, Turkish, Russian)
+- **Container title**: Set to the episode name so players and Plex show a proper title
+- **Fonts**: Subtitle fonts are attached to the MKV (default: small set ~5.5 MB so ASS styling renders correctly; optional full set with `--full-fonts`)
 
 ## Requirements
 
 - **Python 3.9+**
 - **ffmpeg** (in your PATH)
 - **git** (for recursive clone; or the script will clone the subtitle repo at runtime if the submodule is missing)
+- **mkvmerge** (MKVToolNix) – optional; used to attach subtitle fonts into the MKV. If missing, the script skips font attachment and warns (mux still succeeds; ASS may not render correctly on some players).
 
 ## Getting started
 
@@ -80,14 +83,34 @@ python3 onepace_mux.py --output-dir "/path/to/One Pace" --list
 | `--force` | Overwrite existing MKV files |
 | `--backup-dir PATH` | Move old MP4s here instead of deleting |
 | `--subtitle-lang LANG` | Subtitle language: `eng` (default), `deu`/`de`, `por`/`pt`, `ara`/`ar`, `ita`/`it`, `fra`/`fr`, `spa`/`es`, `tur`/`tr`, `rus`/`ru` |
+| `--download-delay SECS` | Pause SECS seconds between each Pixeldrain download (default: 0). Use to spread load and stay under free-tier 6 GB/24h. |
+| `--no-attach-fonts` | Do not attach subtitle fonts (smaller files; ASS may not render correctly on some players). |
+| `--full-fonts` | Attach full font set including Episode Fonts (~37 MB per file). Default is min set (~5.5 MB): common + OP + ED only. |
+| `--debug` | Extra debug output (e.g. subtitle lookup strategy). |
 
 ### Environment (optional)
 
 - **ONEPACE_DIR** – Default One Pace library path if `--output-dir` is not set
 - **ONEPACE_WORK_DIR** – Temp directory for downloads (default: `/tmp/onepace_work`)
 - **ONEPACE_SUBS_DIR** – Where to clone the subtitle repo (default: `/tmp/onepace_subs`)
+- **PIXELDRAIN_API_KEY** – Your [Pixeldrain API key](https://pixeldrain.com/user/api_keys). If set, downloads use HTTP Basic auth so your **premium** account limits apply (no 6 GB/24h throttle). Keep this secret; use the env var, not the command line.
 
 Not all arcs have every language; coverage varies (e.g. English, German, Portuguese have the widest coverage in Final Subs).
+
+### Font attachment
+
+By default the script attaches a **min** font set (~5.5 MB) from the subtitle repo (Common + Opening + Ending fonts) so ASS styling (signs, karaoke, typesetting) renders correctly in players that use embedded fonts. Use `--full-fonts` to attach the full set including Episode Fonts (~37 MB per file) for maximum compatibility. Use `--no-attach-fonts` to skip font attachment and keep files smaller (ASS may fall back to system fonts and look wrong). Requires **mkvmerge** (MKVToolNix); if not installed, the script skips attachment and warns.
+
+### Testing
+
+Tests are in `tests/` and use [pytest](https://pytest.org). From the repo root:
+
+```bash
+pip install pytest
+pytest
+```
+
+CI (GitHub Actions) runs lint (flake8) and tests on push and pull request to `main` for Python 3.9, 3.10, and 3.11.
 
 ### Troubleshooting
 
@@ -95,6 +118,9 @@ Not all arcs have every language; coverage varies (e.g. English, German, Portugu
 - **"unrecognized arguments" when using `--output-dir`** — Your path contains spaces; put it in quotes: `--output-dir "/path/to/One Pace"`.
 - **Episode names like "Jaya 01" instead of full titles** — You didn't clone with submodules. Run `git clone --recursive ...` or, if already cloned, `git submodule update --init --recursive`.
 - **ffmpeg or mux errors** — Ensure `ffmpeg` is installed and on your PATH (`which ffmpeg`).
+- **"mkvmerge not found; skipping font attachment"** — Optional. Install MKVToolNix for your OS so `mkvmerge` is on your PATH if you want fonts embedded; otherwise the script still muxes, but ASS may not render correctly on some players.
+- **Downloads very slow or "speed limited"** — Pixeldrain’s free tier has a **6 GB per 24 hours** (sliding window) limit per IP. Once you exceed it, they throttle download speed. Options: wait for the window to roll off, use a different network/VPN (new IP), or use Pixeldrain premium. You can also use `--download-delay N` to space downloads and spread usage over time.
+- **I have Pixeldrain premium but I’m still throttled** — Set **PIXELDRAIN_API_KEY** to your [API key](https://pixeldrain.com/user/api_keys) (e.g. `export PIXELDRAIN_API_KEY=your-key`) so downloads are authenticated and use your account’s premium limits instead of IP-based free limits.
 
 ## Folder structure
 

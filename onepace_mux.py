@@ -8,11 +8,14 @@ ASS subtitles from GitHub, and muxes them into optimized MKV files with:
   - Japanese AC3 192k audio (from Sub version)
   - English AC3 192k audio (from Dub version, where available)
   - English ASS subtitles (from one-pace-public-subtitles GitHub repo)
+  - Subtitle fonts attached to the MKV (via mkvmerge) so ASS styling renders correctly
 
 Processes one arc (season) at a time, episode by episode, to minimize temp disk usage.
+Requires: ffmpeg; mkvmerge (MKVToolNix) for font attachment (optional, will skip if missing).
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -22,8 +25,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
-import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -31,8 +33,9 @@ from typing import Optional
 # Configuration (overridable via environment or --output-dir)
 # ---------------------------------------------------------------------------
 
-# Set in main() from --output-dir and env (ONEPACE_DIR, ONEPACE_WORK_DIR, ONEPACE_SUBS_DIR)
+# Set in main() from --output-dir and env (ONEPACE_DIR, ONEPACE_WORK_DIR, ONEPACE_SUBS_DIR, PIXELDRAIN_API_KEY)
 ONEPACE_DIR: Path = Path("One Pace")
+PIXELDRAIN_API_KEY: Optional[str] = None  # When set, downloads use HTTP Basic auth so premium limits apply
 WORK_DIR: Path = Path("/tmp/onepace_work")
 SUBS_REPO_DIR: Path = Path("/tmp/onepace_subs")
 SUBS_FINAL_DIR: Path = Path("/tmp/onepace_subs/main/Release/Final Subs")
@@ -40,6 +43,15 @@ SUBS_FINAL_DIR: Path = Path("/tmp/onepace_subs/main/Release/Final Subs")
 SUBS_REPO_URL = "https://github.com/one-pace/one-pace-public-subtitles.git"
 PIXELDRAIN_API = "https://pixeldrain.com/api"
 AC3_BITRATE = "192k"
+
+# Debug logging (set by --debug)
+DEBUG = False
+
+
+def _debug(msg: str) -> None:
+    if DEBUG:
+        print(f"  [DEBUG] {msg}")
+
 
 # Subtitle language: (Final Subs filename suffix before .ass, arc-folder suffix e.g. "en.ass")
 # English = no suffix in Final Subs; others match e.g. " Deutsch.ass", " Arabic.ass"
@@ -72,6 +84,7 @@ SUBTITLE_LANGS = {
     "ru": (" Russian", "ru"),
     "russian": (" Russian", "ru"),
 }
+
 
 # ISO 639-2 code and display name for subtitle track metadata (first key per language wins)
 SUBTITLE_LANG_META = {
@@ -123,7 +136,7 @@ ARCS = [
     ArcConfig("Sabaody Archipelago", 22, "jhpKUqF8", None,        "720p",  "",      "21 Sabaody Archipelago"),
     ArcConfig("Amazon Lily",         23, "Bsr9gKsn", None,        "720p",  "",      "22 Amazon Lily"),
     ArcConfig("Impel Down",          24, "y5ywnHdF", None,        "720p",  "",      "23 Impel Down"),
-    ArcConfig("Straw Hat Adventures",25, "cnjWovN9", "Ua5GkcGr", "720p",  "720p",  "24 If You Could Go Anywhere"),
+    ArcConfig("Straw Hat Adventures", 25, "cnjWovN9", "Ua5GkcGr", "720p", "720p", "24 If You Could Go Anywhere"),
     ArcConfig("Marineford",          26, "uFuFpnpi", None,        "720p",  "",      "25 Marineford"),
     ArcConfig("Post-War",            27, "7EANMSA7", "tEnZhUuP", "720p",  "720p",  "26 Post-War"),
     ArcConfig("Return to Sabaody",   28, "igysH62b", "ED8gfT3e", "720p",  "720p",  "27 Return to Sabaody"),
@@ -138,6 +151,7 @@ ARCS = [
 ]
 
 ARC_BY_SEASON = {a.season: a for a in ARCS}
+
 
 # ---------------------------------------------------------------------------
 # Pixeldrain helpers
@@ -173,7 +187,9 @@ def pd_list_files(list_id: str) -> list[PdFile]:
 
 
 def pd_download(file_id: str, dest: Path, expected_size: int = 0) -> Path:
-    """Download a file from Pixeldrain with progress display."""
+    """Download a file from Pixeldrain with progress display.
+    If PIXELDRAIN_API_KEY is set, uses HTTP Basic auth so your premium account limits apply.
+    """
     url = f"{PIXELDRAIN_API}/file/{file_id}"
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -185,6 +201,10 @@ def pd_download(file_id: str, dest: Path, expected_size: int = 0) -> Path:
     start = time.time()
 
     req = urllib.request.Request(url)
+    if PIXELDRAIN_API_KEY:
+        # Pixeldrain: Basic auth with empty username and API key as password
+        credentials = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode()).decode()
+        req.add_header("Authorization", f"Basic {credentials}")
     try:
         resp = urllib.request.urlopen(req)
     except urllib.error.HTTPError as e:
@@ -222,6 +242,7 @@ def pd_download(file_id: str, dest: Path, expected_size: int = 0) -> Path:
 # Subtitle helpers
 # ---------------------------------------------------------------------------
 
+
 def ensure_subs_repo():
     """Clone or update the subtitle repository."""
     if SUBS_REPO_DIR.exists() and (SUBS_REPO_DIR / ".git").exists():
@@ -243,23 +264,30 @@ def ensure_subs_repo():
     print("  Cloning subtitle repository (one-time)...")
     if SUBS_REPO_DIR.exists():
         shutil.rmtree(SUBS_REPO_DIR)
-    subprocess.run(["git", "clone", "--depth", "1", SUBS_REPO_URL, str(SUBS_REPO_DIR)],
-                    check=True, timeout=300)
+    subprocess.run(
+        ["git", "clone", "--depth", "1", SUBS_REPO_URL, str(SUBS_REPO_DIR)],
+        check=True, timeout=300)
     print("  Subtitle repository ready.")
 
 
-def find_sub_file(arc: ArcConfig, episode_num: int, pd_filename: str, subtitle_lang: str = "eng") -> Optional[Path]:
+def find_sub_file(  # noqa: C901
+    arc: ArcConfig, episode_num: int, pd_filename: str, subtitle_lang: str = "eng"
+) -> Optional[Path]:
     """Find the matching ASS subtitle file for an episode in the requested language.
 
     Search strategy:
-    1. Try matching by Pixeldrain filename pattern in Final Subs
-    2. Try matching by arc name + episode number in Final Subs
-    3. Fall back to arc folder in repo for per-episode subs
+    1. Match by Pixeldrain filename pattern in Final Subs
+    2. Match by arc name + episode number in Final Subs
+    3. Match by arc name only (one sub file for whole arc, e.g. Buggy's Crew, Koby-Meppo)
+    3b. Match by arc_folder description (e.g. "If You Could Go Anywhere")
+    4. Fall back to arc episode folder in repo for per-episode subs
     """
     lang_key = subtitle_lang.strip().lower()
     final_suffix, arc_suffix = SUBTITLE_LANGS.get(lang_key, ("", "en"))
     # English = no suffix in Final Subs; must end with [resolution].ass not *Language.ass
     want_english = final_suffix == ""
+    # Pattern to skip non-English language variants when want_english (include Polish; repo uses "Polish.ass")
+    non_english_lang = r'(Deutsch|Arabic|Italian|Portugues|French|Spanish|Turkish|Russian|Polish)'
 
     # Extract the common prefix: [One Pace][chapters] ArcName NN
     base_match = re.match(r'(\[One Pace\]\[.*?\]\s+\S+.*?\s+\d+)', pd_filename)
@@ -271,16 +299,18 @@ def find_sub_file(arc: ArcConfig, episode_num: int, pd_filename: str, subtitle_l
             if not f.name.endswith(".ass"):
                 continue
             if want_english:
-                if re.search(r'(Deutsch|Arabic|Italian|Portugues|French|Spanish|Turkish|Russian)\s*\.ass$', f.name, re.IGNORECASE):
+                if re.search(rf'{non_english_lang}\s*\.ass$', f.name, re.IGNORECASE):
                     continue
-                if re.search(r'(Deutsch|Arabic|Italian|Portugues|French|Spanish|Turkish|Russian)\s+(Extended|Alternate)', f.name, re.IGNORECASE):
+                if re.search(rf'{non_english_lang}\s+(Extended|Alternate)', f.name, re.IGNORECASE):
                     continue
             else:
                 if not f.name.endswith(final_suffix + ".ass"):
                     continue
-                if re.search(r'\s+(Extended|Alternate)\s*\.ass$', f.name, re.IGNORECASE) and final_suffix + " Extended" not in f.name and final_suffix + " Alternate" not in f.name:
+                ext_alt = re.search(r'\s+(Extended|Alternate)\s*\.ass$', f.name, re.IGNORECASE)
+                if ext_alt and final_suffix + " Extended" not in f.name and final_suffix + " Alternate" not in f.name:
                     continue
             if f.name.startswith(prefix):
+                _debug(f"sub Strategy 1 (prefix): {f.name}")
                 return f
 
     # Strategy 2: Match by arc name pattern + episode number in Final Subs
@@ -289,35 +319,95 @@ def find_sub_file(arc: ArcConfig, episode_num: int, pd_filename: str, subtitle_l
         if not f.name.endswith(".ass"):
             continue
         if want_english:
-            if re.search(r'(Deutsch|Arabic|Italian|Portugues|French|Spanish|Turkish|Russian)', f.name, re.IGNORECASE):
+            if re.search(non_english_lang, f.name, re.IGNORECASE):
                 continue
         else:
             if not f.name.endswith(final_suffix + ".ass"):
                 continue
         ep_match = re.search(rf'{arc_name_pattern}\s+0*{episode_num}\b', f.name, re.IGNORECASE)
         if ep_match:
+            _debug(f"sub Strategy 2 (arc+ep): {f.name}")
             return f
 
-    # Strategy 3: Fall back to arc episode folder (e.g. "14 Skypiea/24/skypiea 24 en.ass")
-    if arc.arc_folder:
-        arc_dir = SUBS_REPO_DIR / "main" / arc.arc_folder / f"{episode_num:02d}"
-        if not arc_dir.exists():
-            arc_dir = SUBS_REPO_DIR / "main" / arc.arc_folder / str(episode_num)
-        if arc_dir.exists():
-            candidates = []
-            for f in sorted(arc_dir.iterdir()):
-                if not f.name.endswith(f" {arc_suffix}.ass"):
-                    continue
-                candidates.append(f)
-            if candidates:
-                non_alt = [f for f in candidates if "alternate" not in f.name.lower()]
-                return non_alt[0] if non_alt else candidates[0]
+    # Strategy 3: Match by arc name only when there is exactly one such file (whole-arc sub, e.g. Buggy's Crew).
+    # If multiple files match (e.g. Alabasta 01, 02, 03...), do not use this — we'd wrongly reuse one ep's subs.
+    arc_name_flex = re.sub(r"[-'\s]+", r"[\\s'-]*", re.escape(arc.name))
+    arc_name_re = re.compile(rf'\b{arc_name_flex}\b', re.IGNORECASE)
+    strategy3_matches = []
+    for f in sorted(SUBS_FINAL_DIR.iterdir()):
+        if not f.name.endswith(".ass"):
+            continue
+        if want_english:
+            if re.search(non_english_lang, f.name, re.IGNORECASE):
+                continue
+        else:
+            if not f.name.endswith(final_suffix + ".ass"):
+                continue
+        if arc_name_re.search(f.name):
+            strategy3_matches.append(f)
+    if len(strategy3_matches) == 1:
+        _debug(f"sub Strategy 3 (arc name, single file): {strategy3_matches[0].name}")
+        return strategy3_matches[0]
 
+    # Strategy 3b: Match by arc_folder description (e.g. "If You Could Go Anywhere" for Straw Hat Adventures)
+    if arc.arc_folder:
+        # arc_folder is like "24 If You Could Go Anywhere" -> match "If You Could Go Anywhere"
+        folder_desc = re.sub(r"^\d+\s+", "", arc.arc_folder).strip()
+        if folder_desc:
+            desc_flex = re.sub(r"[-'\s]+", r"[\\s'-]*", re.escape(folder_desc))
+            desc_re = re.compile(rf'\b{desc_flex}\b', re.IGNORECASE)
+            for f in sorted(SUBS_FINAL_DIR.iterdir()):
+                if not f.name.endswith(".ass"):
+                    continue
+                if want_english:
+                    if re.search(non_english_lang, f.name, re.IGNORECASE):
+                        continue
+                else:
+                    if not f.name.endswith(final_suffix + ".ass"):
+                        continue
+                if desc_re.search(f.name):
+                    _debug(f"sub Strategy 3b (arc_folder desc): {f.name}")
+                    return f
+
+    # Strategy 4: Fall back to arc episode folder (e.g. "14 Skypiea/24/skypiea 24 en.ass")
+    # Script arc_folder may use season numbering (e.g. "14 Alabasta"); repo may use different (e.g. "12 Alabasta")
+    main_dir = SUBS_REPO_DIR / "main"
+    if main_dir.exists():
+        arc_folder_candidates = []
+        if arc.arc_folder and (main_dir / arc.arc_folder).exists():
+            arc_folder_candidates.append(arc.arc_folder)
+        # If configured folder missing, find a folder whose name contains the arc name (e.g. "12 Alabasta")
+        arc_name_simple = arc.name.replace("'", "").replace("-", " ")
+        for d in main_dir.iterdir():
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            if arc.name in d.name or arc_name_simple in d.name.replace("-", " "):
+                if d.name not in arc_folder_candidates:
+                    arc_folder_candidates.append(d.name)
+        _debug(f"Strategy 4 arc_folder candidates: {arc_folder_candidates}")
+        for folder_name in arc_folder_candidates:
+            arc_dir = main_dir / folder_name / f"{episode_num:02d}"
+            if not arc_dir.exists():
+                arc_dir = main_dir / folder_name / str(episode_num)
+            if arc_dir.exists():
+                candidates = []
+                for f in sorted(arc_dir.iterdir()):
+                    if not f.name.endswith(f" {arc_suffix}.ass"):
+                        continue
+                    candidates.append(f)
+                if candidates:
+                    non_alt = [f for f in candidates if "alternate" not in f.name.lower()]
+                    chosen = non_alt[0] if non_alt else candidates[0]
+                    _debug(f"sub Strategy 4 (arc folder {folder_name!r}): {chosen.name}")
+                    return chosen
+
+    _debug(f"no sub (arc={arc.name!r} ep={episode_num} pd={pd_filename!r})")
     return None
 
 # ---------------------------------------------------------------------------
 # NFO / Plex naming helpers
 # ---------------------------------------------------------------------------
+
 
 def get_nfo_source_dir() -> Optional[Path]:
     """Return the one-pace-for-plex 'One Pace' directory next to this script, or None if missing."""
@@ -362,11 +452,93 @@ def get_plex_name(season_dir: Path, episode_num: int) -> Optional[str]:
             return nfo.stem  # e.g., "One Pace - S15E01 - Why the Log Pose Is Spherical"
     return None
 
+
+# ---------------------------------------------------------------------------
+# Font attachment (for ASS styling; matches SubKt attach layout)
+# Paths relative to subtitle repo main/ (same as sub.properties).
+# "min" = common + OP + ED only (~5.5 MB). "full" = also Episode Fonts (~37 MB total).
+# ---------------------------------------------------------------------------
+
+FONT_DIRS_MIN = ("Other/Common Fonts", "Other/Opening/Opening Fonts", "Other/Ending/Ending Fonts")
+FONT_DIR_EPISODE = "Other/Episode Fonts"  # large (~29 MB); only included when attach_fonts="full"
+# Subtitle language key -> extra font dir (relative to main/)
+SUBTITLE_LANG_FONT_DIR = {
+    "de": "Other/German Fonts", "deu": "Other/German Fonts", "deutsch": "Other/German Fonts", "ger": "Other/German Fonts",
+    "es": "Other/Spanish Fonts", "spa": "Other/Spanish Fonts", "spanish": "Other/Spanish Fonts",
+    "ar": "Other/Arabic Fonts", "ara": "Other/Arabic Fonts", "arabic": "Other/Arabic Fonts",
+    "pl": "Other/Polish Fonts",
+    "ru": "Other/Russian Fonts", "rus": "Other/Russian Fonts", "russian": "Other/Russian Fonts",
+    "he": "Other/Hebrew Fonts",
+}
+
+
+def collect_font_files(subs_main_dir: Path, subtitle_lang: str, full_fonts: bool = False) -> list[Path]:  # noqa: C901
+    """Collect .ttf and .otf from repo font dirs.
+    full_fonts=False uses min set (~5.5 MB); True adds Episode Fonts (~37 MB). Deduplicated by path.
+    """
+    seen: set[Path] = set()
+    out: list[Path] = []
+    dirs: list[str] = [*FONT_DIRS_MIN]
+    if full_fonts:
+        dirs.append(FONT_DIR_EPISODE)
+    for rel in dirs:
+        d = subs_main_dir / rel
+        if not d.is_dir():
+            continue
+        for ext in ("*.ttf", "*.otf"):
+            for f in d.glob(ext):
+                r = f.resolve()
+                if r not in seen:
+                    seen.add(r)
+                    out.append(f)
+    extra = SUBTITLE_LANG_FONT_DIR.get(subtitle_lang.strip().lower())
+    if extra:
+        d = subs_main_dir / extra
+        if d.is_dir():
+            for ext in ("*.ttf", "*.otf"):
+                for f in d.glob(ext):
+                    r = f.resolve()
+                    if r not in seen:
+                        seen.add(r)
+                        out.append(f)
+    return sorted(out, key=lambda p: p.name)
+
+
+def attach_fonts_to_mkv(mkv_path: Path, font_files: list[Path], dry_run: bool = False) -> bool:
+    """Append font attachments to MKV using mkvmerge (MKVToolNix). Overwrites mkv_path in place."""
+    if not font_files:
+        return True
+    mkvmerge = shutil.which("mkvmerge")
+    if not mkvmerge:
+        print("    [WARN] mkvmerge not found (MKVToolNix); skipping font attachment.")
+        return True
+    out_temp = mkv_path.with_suffix(".mkv.fonts_tmp")
+    # MIME: TTF = font/ttf or application/x-truetype-font, OTF = font/otf
+    args = [mkvmerge, "-q", "-o", str(out_temp), str(mkv_path)]
+    for f in font_files:
+        mime = "application/x-truetype-font" if f.suffix.lower() == ".ttf" else "font/otf"
+        args += ["--attachment-mime-type", mime, "--attach-file", str(f)]
+    if dry_run:
+        print(f"    [dry-run] Would attach {len(font_files)} font(s) with mkvmerge")
+        return True
+    print(f"    Attaching {len(font_files)} font(s)...")
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"    [ERROR] mkvmerge failed:\n{result.stderr}")
+        return False
+    try:
+        out_temp.replace(mkv_path)
+    except OSError as e:
+        print(f"    [ERROR] Could not replace MKV with font-attached version: {e}")
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Muxing
 # ---------------------------------------------------------------------------
 
-def mux_episode(
+def mux_episode(  # noqa: C901
     sub_file: Path,
     dub_file: Optional[Path],
     ass_file: Optional[Path],
@@ -386,6 +558,8 @@ def mux_episode(
       - ASS subtitles
     """
     sub_iso, sub_title = SUBTITLE_LANG_META.get(subtitle_lang.strip().lower(), ("eng", "English"))
+    # Container title for players/Plex (matches SubKt convention: title on mux)
+    container_title = output_file.stem  # e.g. "One Pace - S15E01 - Why the Log Pose Is Spherical"
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning", "-stats"]
 
     if dub_file:
@@ -457,7 +631,7 @@ def mux_episode(
                 "-disposition:s:0", "default",
             ]
 
-    cmd += [str(output_file)]
+    cmd += ["-metadata", f"title={container_title}", str(output_file)]
 
     if dry_run:
         print(f"    [dry-run] Would run: {' '.join(cmd)}")
@@ -474,15 +648,18 @@ def mux_episode(
 # Main processing
 # ---------------------------------------------------------------------------
 
-def process_arc(arc: ArcConfig, force: bool = False, dry_run: bool = False,
-                backup_dir: Optional[Path] = None, subtitle_lang: str = "eng"):
-    """Process a single arc: download, mux, rename, replace."""
+
+def process_arc(arc: ArcConfig, force: bool = False, dry_run: bool = False,  # noqa: C901
+                backup_dir: Optional[Path] = None, subtitle_lang: str = "eng",
+                download_delay: float = 0, attach_fonts: bool = True, full_fonts: bool = False):
+    """Process a single arc: download, mux, attach fonts (if requested), rename, replace."""
     season_dir = ONEPACE_DIR / f"Season {arc.season}"
     season_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*70}")
     print(f"Processing: {arc.name} (Season {arc.season})")
     print(f"{'='*70}")
+    _debug(f"SUBS_FINAL_DIR={SUBS_FINAL_DIR} arc_folder={arc.arc_folder!r}")
 
     # Fetch file lists from Pixeldrain
     print(f"  Querying Pixeldrain for Sub files (list: {arc.sub_id})...")
@@ -531,6 +708,7 @@ def process_arc(arc: ArcConfig, force: bool = False, dry_run: bool = False,
             print(f"    Subtitle: {ass_file.name}")
         else:
             print(f"    [WARN] No subtitle file found for episode {ep_num}")
+            _debug(f"pd filename tried: {sub_pf.name!r}")
 
         if dry_run:
             print(f"    [dry-run] Would download Sub: {sub_pf.name} ({sub_pf.size/1024/1024:.1f} MB)")
@@ -549,12 +727,16 @@ def process_arc(arc: ArcConfig, force: bool = False, dry_run: bool = False,
             # Download sub
             sub_local = ep_work / f"sub_{sub_pf.name}"
             pd_download(sub_pf.file_id, sub_local, sub_pf.size)
+            if download_delay > 0:
+                time.sleep(download_delay)
 
             # Download dub
             dub_local = None
             if dub_pf:
                 dub_local = ep_work / f"dub_{dub_pf.name}"
                 pd_download(dub_pf.file_id, dub_local, dub_pf.size)
+                if download_delay > 0:
+                    time.sleep(download_delay)
 
             # Mux
             temp_output = ep_work / f"{plex_name}.mkv"
@@ -562,6 +744,15 @@ def process_arc(arc: ArcConfig, force: bool = False, dry_run: bool = False,
             if not ok:
                 error_count += 1
                 continue
+
+            # Attach fonts for ASS styling (if we have subtitles and attach_fonts)
+            if attach_fonts and ass_file:
+                subs_main_dir = SUBS_FINAL_DIR.parent.parent
+                font_files = collect_font_files(subs_main_dir, subtitle_lang, full_fonts=full_fonts)
+                if font_files:
+                    if not attach_fonts_to_mkv(temp_output, font_files, dry_run=False):
+                        error_count += 1
+                        continue
 
             # Move to final location
             old_mp4 = season_dir / f"{plex_name}.mp4"
@@ -600,7 +791,8 @@ def process_arc(arc: ArcConfig, force: bool = False, dry_run: bool = False,
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+
+def main():  # noqa: C901
     parser = argparse.ArgumentParser(
         description="Download and mux One Pace episodes with dual audio + subtitles",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -624,8 +816,18 @@ Examples:
     parser.add_argument("--subtitle-lang", type=str, default="eng",
                         help="Subtitle language: eng, deu, por, ara, ita, fra, spa, tur, rus (default: eng)")
     parser.add_argument("--list", action="store_true", help="List all arcs and their status")
+    parser.add_argument("--debug", action="store_true", help="Print extra debug (e.g. subtitle lookup strategy, paths)")
+    parser.add_argument("--download-delay", type=float, default=0, metavar="SECS",
+                        help="Pause SECS between downloads (0=no delay). Spreads load under free-tier 6 GB/24h.")
+    parser.add_argument("--no-attach-fonts", action="store_true",
+                        help="Do not attach subtitle fonts (smaller files; ASS may not render correctly)")
+    parser.add_argument("--full-fonts", action="store_true",
+                        help="Attach full font set including Episode Fonts (~37 MB/file). Default: min set (~5.5 MB).")
 
     args = parser.parse_args()
+
+    global DEBUG
+    DEBUG = bool(args.debug)
 
     if args.subtitle_lang and args.subtitle_lang.strip().lower() not in SUBTITLE_LANGS:
         print(f"[ERROR] Unknown subtitle language: {args.subtitle_lang}")
@@ -633,8 +835,9 @@ Examples:
         sys.exit(1)
 
     # Set paths from args and environment
-    global ONEPACE_DIR, WORK_DIR, SUBS_REPO_DIR, SUBS_FINAL_DIR
+    global ONEPACE_DIR, WORK_DIR, SUBS_REPO_DIR, SUBS_FINAL_DIR, PIXELDRAIN_API_KEY
     ONEPACE_DIR = (args.output_dir or Path(os.environ.get("ONEPACE_DIR", "One Pace"))).expanduser().resolve()
+    PIXELDRAIN_API_KEY = (os.environ.get("PIXELDRAIN_API_KEY") or "").strip() or None
     WORK_DIR = Path(os.environ.get("ONEPACE_WORK_DIR", "/tmp/onepace_work")).expanduser().resolve()
     if os.environ.get("ONEPACE_SUBS_DIR"):
         SUBS_REPO_DIR = Path(os.environ.get("ONEPACE_SUBS_DIR")).expanduser().resolve()
@@ -699,7 +902,9 @@ Examples:
     for s in seasons_to_process:
         arc = ARC_BY_SEASON[s]
         ok = process_arc(arc, force=args.force, dry_run=args.dry_run,
-                         backup_dir=args.backup_dir, subtitle_lang=args.subtitle_lang)
+                         backup_dir=args.backup_dir, subtitle_lang=args.subtitle_lang,
+                         download_delay=args.download_delay, attach_fonts=not args.no_attach_fonts,
+                         full_fonts=args.full_fonts)
         results[s] = ok
 
     elapsed = time.time() - total_start
