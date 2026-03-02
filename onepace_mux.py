@@ -378,17 +378,28 @@ def ensure_subs_repo():
     if SUBS_REPO_DIR.exists() and (SUBS_REPO_DIR / ".git").exists():
         log.info("  Updating subtitle repository...")
         result = subprocess.run(
-            ["git", "pull", "--ff-only"],
+            ["git", "fetch", "--depth=1", "origin", "HEAD"],
             cwd=SUBS_REPO_DIR,
             capture_output=True,
             timeout=60,
             text=True,
         )
         if result.returncode != 0:
-            log.error("Subtitle repo update failed (git pull exited %d).", result.returncode)
+            log.error("Subtitle repo update failed (git fetch exited %d).", result.returncode)
             if result.stderr:
                 log.error("%s", result.stderr.strip())
-            log.error("  Fix the repo (e.g. resolve conflicts) or remove it and re-run so it can clone fresh.")
+            log.error("  Remove the repo dir and re-run so it can clone fresh.")
+            sys.exit(1)
+        result = subprocess.run(
+            ["git", "reset", "--hard", "FETCH_HEAD"],
+            cwd=SUBS_REPO_DIR,
+            capture_output=True,
+            timeout=30,
+            text=True,
+        )
+        if result.returncode != 0:
+            log.error("Subtitle repo reset failed: %s", result.stderr.strip())
+            log.error("  Remove the repo dir and re-run so it can clone fresh.")
             sys.exit(1)
         return
     log.info("  Cloning subtitle repository (one-time)...")
@@ -593,6 +604,27 @@ def get_nfo_source_dir() -> Optional[Path]:
     script_dir = Path(__file__).resolve().parent
     nfo_source = script_dir / "one-pace-for-plex" / "One Pace"
     return nfo_source if nfo_source.is_dir() else None
+
+
+def update_nfo_submodule() -> None:
+    """Update the one-pace-for-plex submodule to its latest remote commit, if present."""
+    script_dir = Path(__file__).resolve().parent
+    gitfile = script_dir / "one-pace-for-plex" / ".git"
+    # .git is a file (not a dir) only when initialized as a proper git submodule
+    if not gitfile.is_file():
+        return
+    log.info("  Updating one-pace-for-plex submodule...")
+    result = subprocess.run(
+        ["git", "submodule", "update", "--remote", "one-pace-for-plex"],
+        cwd=script_dir,
+        capture_output=True,
+        timeout=60,
+        text=True,
+    )
+    if result.returncode != 0:
+        log.warning("Could not update one-pace-for-plex submodule: %s", result.stderr.strip())
+    else:
+        log.info("  one-pace-for-plex submodule updated.")
 
 
 def get_subs_source_dir() -> Optional[Path]:
@@ -1066,6 +1098,7 @@ Examples:
         return
 
     if args.copy_nfo_only:
+        update_nfo_submodule()
         nfo_source = get_nfo_source_dir()
         if not nfo_source:
             log.error("one-pace-for-plex submodule not found. Clone with: git clone --recursive ...")
@@ -1100,7 +1133,8 @@ Examples:
         log.info("  [NOTE] one-pace-for-plex submodule not found; episode names will use fallback (e.g. Jaya 01).")
         log.info("         Clone with: git clone --recursive https://github.com/snoopyh42/one-pace-mux.git")
 
-    # Ensure subtitle repo
+    # Update NFO submodule and subtitle repo to latest
+    update_nfo_submodule()
     ensure_subs_repo()
 
     if not SUBS_FINAL_DIR.is_dir():
